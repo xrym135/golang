@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="RemoteTargetsManager">
+    <targets>
+      <target name="mysql@172.17.139.34:22" type="ssh/sftp" uuid="fe0d7756-9378-4649-9e0b-8c327508a248">
+        <config>
+          <option name="projectRootOnTarget" value="/home/mysql/giogii-giogio" />
+          <option name="serverName" value="mysql@172.17.139.181:22 password" />
+        </config>
+        <ContributedStateBase type="GoLanguageRuntime">
+          <config>
+            <option name="goPath" value="/usr/local/go" />
+            <option name="goRoot" value="/usr/local/go/bin/go" />
+            <option name="goVersion" value="go1.15.5 linux/amd64" />
+          </config>
+        </ContributedStateBase>
+      </target>
+      <target name="mysql@172.17.139.181:22" type="ssh/sftp" uuid="5bd585de-73c0-4b70-9680-ca15ac7e7cd0">
+        <config>
+          <option name="projectRootOnTarget" value="/home/mysql/giogii-giogio" />
+          <option name="serverName" value="mysql@172.17.139.181:22 password" />
+        </config>
+        <ContributedStateBase type="GoLanguageRuntime">
+          <config>
+            <option name="goPath" value="/home/mysql/go" />
+            <option name="goRoot" value="/usr/local/go/bin/go" />
+            <option name="goVersion" value="go1.20 linux/amd64" />
+          </config>
+        </ContributedStateBase>
+      </target>
+    </targets>
+  </component>
+</project>

@@ -1,0 +1,49 @@
+mysql:
+  host: "172.17.139.15"
+  port: 16315
+  username: "admin"
+  password: "!QAZ2wsx"
+  database: "information_schema"
+  timeout: 10
+
+inspection:
+  interval: 300
+  max_snapshots: 10
+  log_level: "DEBUG"
+
+plugins:
+  performance:
+    enabled: true
+    interval: 60
+    params:
+      max_connections: 500
+      qps_threshold: 1000.0
+      tps_threshold: 500.0
+  
+  slow_query:
+    enabled: true
+    interval: 300
+    params:
+      slow_query_threshold: 2.0
+  
+  table_space:
+    enabled: true
+    interval: 600
+    params:
+      max_table_size: 10737418240  # 10GB
+      max_fragmentation: 30.0
+  
+  replication:
+    enabled: false
+    interval: 60
+    params:
+      max_replication_lag: 60
+
+thresholds:
+  cpu_usage: 80.0
+  memory_usage: 85.0
+  disk_usage: 90.0
+  slow_query_time: 2.0
+  max_connections: 500
+  qps_threshold: 1000.0
+  tps_threshold: 500.0

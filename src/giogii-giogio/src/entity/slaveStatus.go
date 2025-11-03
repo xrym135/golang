@@ -1,0 +1,66 @@
+package entity
+
+import "database/sql"
+
+type SlaveStatus struct {
+	SlaveIOState              string
+	MasterHost                string
+	MasterUser                string
+	MasterPort                *int
+	ConnectRetry              *int
+	MasterLogFile             string
+	ReadMasterLogPos          *int
+	RelayLogFile              string
+	RelayLogPos               *int
+	RelayMasterLogFile        string
+	SlaveIORunning            string
+	SlaveSQLRunning           string
+	ReplicateDoDB             string
+	ReplicateIgnoreDB         string
+	ReplicateDoTable          string
+	ReplicateIgnoreTable      string
+	ReplicateWildDoTable      string
+	ReplicateWildIgnoreTable  string
+	LastErrno                 *int
+	LastError                 string
+	SkipCounter               *int
+	ExecMasterLogPos          *int
+	RelayLogSpace             *int
+	UntilCondition            string
+	UntilLogFile              string
+	UntilLogPos               *int
+	MasterSSLAllowed          string
+	MasterSSLCAFile           string
+	MasterSSLCAPath           string
+	MasterSSLCert             string
+	MasterSSLCipher           string
+	MasterSSLKey              string
+	SecondsBehindMaster       sql.NullInt64
+	MasterSSLVerifyServerCert string
+	LastIOErrno               *int
+	LastIOError               string
+	LastSQLErrno              *int
+	LastSQLError              string
+	ReplicateIgnoreServerIds  string
+	MasterServerId            *int
+	MasterUUID                string
+	MasterInfoFile            string
+	SQLDelay                  *int
+	SQLRemainingDelay         *int
+	SlaveSQLRunningState      string
+	MasterRetryCount          *int
+	MasterBind                string
+	LastIOErrorTimestamp      string
+	LastSQLErrorTimestamp     string
+	MasterSSLCrl              string
+	MasterSSLCrlpath          string
+	RetrievedGtidSet          string
+	ExecutedGtidSet           string
+	AutoPosition              *int
+	ReplicateRewriteDB        string
+	ChannelName               string
+	MasterTLSVersion          string
+	Masterpublickeypath       string
+	Getmasterpublickey        *int
+	NetworkNamespace          string
+}

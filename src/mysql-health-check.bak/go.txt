@@ -1,0 +1,1257 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"flag"
+	"fmt"
+	"os"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+
+	"laowang/mysql-health-check/internal/collector"
+	"laowang/mysql-health-check/internal/config"
+	"laowang/mysql-health-check/internal/exporter"
+	"laowang/mysql-health-check/internal/logger"
+	"laowang/mysql-health-check/pkg/dbconn"
+)
+
+func main() {
+	cfgPath := flag.String("config", "", "配置文件路径（可选）")
+	flag.Parse()
+
+	cfg := config.NewConfig()
+	if *cfgPath != "" {
+		if err := cfg.LoadFromFile(*cfgPath); err != nil {
+			fmt.Printf("配置文件加载失败: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	logger.InitLogger(cfg.GetLogLevel())
+	logger.Info("启动 MySQL 健康检查")
+
+	// 建立数据库连接
+	db, err := dbconn.NewConnection(dbconn.Config{
+		Host:           cfg.GetHost(),
+		Port:           cfg.GetPort(),
+		User:           cfg.GetUser(),
+		Password:       cfg.GetPassword(),
+		Database:       cfg.GetDatabase(),
+		ConnectTimeout: cfg.GetQueryTimeout(),
+		QueryTimeout:   cfg.GetQueryTimeout(),
+	})
+	if err != nil {
+		logger.Fatal("数据库连接失败: %v", err)
+	}
+	defer db.Close()
+
+	// CollectorManager 与注册
+	manager := collector.NewCollectorManager()
+	manager.RegisterSingleCollector(collector.NewBaseCollector())
+	manager.RegisterSingleCollector(collector.NewConnectionCollector())
+	manager.RegisterSingleCollector(collector.NewBufferPoolCollector())
+	manager.RegisterSingleCollector(collector.NewReplicationCollector())
+	manager.RegisterPeriodicCollector(collector.NewPerformanceCollector())
+
+	// 执行健康检查
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.GetTotalTimeout())
+	defer cancel()
+
+	startTime := time.Now()
+	result, err := runHealthCheck(ctx, db, manager, cfg)
+	duration := time.Since(startTime)
+
+	if err != nil {
+		logger.Fatal("健康检查失败: %v", err)
+	}
+
+	// 设置执行耗时
+	result.Duration = duration
+
+	// 输出
+	var exp exporter.Exporter = exporter.NewTextExporter()
+	if cfg.OutputFormat() == "json" {
+		exp = exporter.NewJSONExporter()
+	}
+	if err := exp.Export(result); err != nil {
+		logger.Error("导出结果失败: %v", err)
+	}
+
+	logger.Info("健康检查完成")
+}
+
+func runHealthCheck(ctx context.Context, db *sql.DB, manager *collector.CollectorManager, cfg *config.Config) (*collector.AggregatedResult, error) {
+	res := &collector.AggregatedResult{
+		Timestamp: time.Now(),
+		Instance: collector.InstanceInfo{
+			Host: cfg.GetHost(),
+			Port: cfg.GetPort(),
+		},
+		Details: make(map[string]collector.CollectorResult),
+		Summary: map[collector.HealthLevel]int{},
+	}
+
+	// 获取版本信息
+	baseCollector := collector.NewBaseCollector()
+	if version, err := baseCollector.GetVersion(ctx, db); err == nil {
+		res.Instance.Version = version
+	}
+
+	// 单次采集器
+	for _, c := range manager.GetAllSingleCollectors() {
+		name := c.Name()
+		if !cfg.IsCollectorEnabled("single", name) {
+			logger.Debug("跳过单次采集器: %s", name)
+			continue
+		}
+		logger.Debug("运行单次采集器: %s", name)
+		cr, err := c.Collect(ctx, db)
+		if err != nil {
+			logger.Warn("采集器 %s 运行失败: %v", name, err)
+			continue
+		}
+		res.Details[name] = cr
+		res.Summary[cr.Status]++
+	}
+
+	// 周期采集器
+	period := cfg.GetPeriod()
+	if cfg.ShouldRunPeriodic() {
+		for _, pc := range manager.GetAllPeriodicCollectors() {
+			name := pc.Name()
+			if !cfg.IsCollectorEnabled("periodic", name) {
+				logger.Debug("跳过周期采集器: %s", name)
+				continue
+			}
+			logger.Debug("周期采集器 %s 开始第一次快照", name)
+			s1, err := pc.TakeSnapshot(ctx, db)
+			if err != nil {
+				logger.Warn("第一次快照失败: %v", err)
+				continue
+			}
+			select {
+			case <-time.After(period):
+			case <-ctx.Done():
+				return res, ctx.Err()
+			}
+			logger.Debug("周期采集器 %s 开始第二次快照", name)
+			s2, err := pc.TakeSnapshot(ctx, db)
+			if err != nil {
+				logger.Warn("第二次快照失败: %v", err)
+				continue
+			}
+			cr, err := pc.CalculateDelta(s1, s2)
+			if err != nil {
+				logger.Warn("增量计算失败: %v", err)
+				continue
+			}
+			res.Details[name] = cr
+			res.Summary[cr.Status]++
+		}
+	}
+
+	// 计算总体状态
+	res.Overall = collector.AggregateOverall(res.Summary)
+	return res, nil
+}
+module laowang/mysql-health-check
+
+go 1.21.13
+
+require github.com/go-sql-driver/mysql v1.9.3
+
+require filippo.io/edwards25519 v1.1.0 // indirect
+filippo.io/edwards25519 v1.1.0 h1:FNf4tywRC1HmFuKW5xopWpigGjJKiJSV0Cqo0cJWDaA=
+filippo.io/edwards25519 v1.1.0/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4VDT4=
+github.com/go-sql-driver/mysql v1.9.3 h1:U/N249h2WzJ3Ukj8SowVFjdtZKfu9vlLZxjPXV1aweo=
+github.com/go-sql-driver/mysql v1.9.3/go.mod h1:qn46aNg1333BRMNU69Lq93t8du/dwxI64Gl8i5p1WMU=
+package collector
+
+import (
+	"context"
+	"database/sql"
+	"strconv"
+
+	"laowang/mysql-health-check/pkg/core"
+)
+
+type BaseCollector struct{}
+
+func NewBaseCollector() *BaseCollector { return &BaseCollector{} }
+
+func (c *BaseCollector) Name() string { return "base" }
+
+func (c *BaseCollector) Collect(ctx context.Context, db *sql.DB) (core.CollectorResult, error) {
+	cr := core.CollectorResult{
+		Name:    c.Name(),
+		Metrics: map[string]float64{},
+		Status:  core.HealthOK,
+		Message: "基础信息", // 简化消息，版本信息已在头部显示
+	}
+
+	// 读取 Uptime
+	var name, val string
+	rows, err := db.QueryContext(ctx, "SHOW GLOBAL STATUS LIKE 'Uptime'")
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			_ = rows.Scan(&name, &val)
+			if v, e := strconv.ParseFloat(val, 64); e == nil {
+				cr.Metrics["uptime_s"] = v
+				cr.Metrics["uptime_hours"] = v / 3600
+				cr.Metrics["uptime_days"] = v / 86400
+
+				// 若 uptime 小于 300s 标记警告
+				if v < 300 {
+					cr.Status = core.HealthWarn
+					cr.Message = "新启动实例"
+				}
+			}
+		}
+	}
+
+	return cr, nil
+}
+
+// GetVersion 辅助函数，用于获取版本信息
+func (c *BaseCollector) GetVersion(ctx context.Context, db *sql.DB) (string, error) {
+	var version string
+	err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version)
+	if err != nil {
+		return "", err
+	}
+	return version, nil
+}
+package collector
+
+import (
+	"context"
+	"database/sql"
+	"strconv"
+	"strings"
+
+	"laowang/mysql-health-check/internal/logger"
+	"laowang/mysql-health-check/pkg/core"
+)
+
+// BufferPoolCollector 检查 InnoDB 缓冲池相关指标。
+type BufferPoolCollector struct{}
+
+func NewBufferPoolCollector() *BufferPoolCollector { return &BufferPoolCollector{} }
+func (c *BufferPoolCollector) Name() string        { return "buffer_pool" }
+
+func (c *BufferPoolCollector) Collect(ctx context.Context, db *sql.DB) (core.CollectorResult, error) {
+	cr := core.CollectorResult{
+		Name:    c.Name(),
+		Metrics: map[string]float64{},
+		Status:  core.HealthOK,
+	}
+
+	// 预置常用字段，默认 -1 表示不可用
+	expected := []string{
+		"innodb_buffer_pool_size", // MB
+		"Innodb_buffer_pool_pages_data",
+		"Innodb_buffer_pool_pages_dirty",
+		"Innodb_buffer_pool_read_requests",
+		"Innodb_buffer_pool_reads",
+		"Innodb_buffer_pool_pages_free",
+		"Innodb_buffer_pool_pages_total",
+		"Innodb_buffer_pool_pages_misc",
+		"Innodb_buffer_pool_pages_old",
+		"Innodb_buffer_pool_write_requests",
+		"Innodb_buffer_pool_pages_flushed",
+	}
+	for _, k := range expected {
+		cr.Metrics[k] = -1
+	}
+
+	// 1) 读取 Innodb_buffer_pool_* 系列的 GLOBAL STATUS
+	// 只查询数值型的状态变量，避免字符串类型的变量
+	rows, err := db.QueryContext(ctx, `
+		SHOW GLOBAL STATUS WHERE Variable_name LIKE 'Innodb_buffer_pool%' 
+		AND Variable_name NOT LIKE '%status%'
+		AND Variable_name NOT LIKE '%dump%'
+		AND Variable_name NOT LIKE '%load%'
+	`)
+	if err != nil {
+		logger.Warn("读取 Innodb_buffer_pool_* 状态失败: %v", err)
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			var name, val string
+			if err := rows.Scan(&name, &val); err != nil {
+				logger.Debug("扫描 buffer_pool 状态失败: %v", err)
+				continue
+			}
+
+			// 跳过空值或非数字值
+			if val == "" || strings.Contains(strings.ToLower(val), "not started") ||
+				strings.Contains(strings.ToLower(val), "completed") {
+				logger.Debug("跳过非数值状态变量: %s = %s", name, val)
+				continue
+			}
+
+			if v, e := strconv.ParseFloat(val, 64); e == nil {
+				cr.Metrics[name] = v
+			} else {
+				logger.Debug("解析 buffer_pool 指标 %s 值失败: %v (raw=%s)", name, e, val)
+			}
+		}
+	}
+
+	// 2) 单独读取 innodb_buffer_pool_size（bytes -> MB）
+	var poolSizeInt sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT @@innodb_buffer_pool_size").Scan(&poolSizeInt); err != nil {
+		logger.Warn("读取 innodb_buffer_pool_size 失败: %v", err)
+	} else if poolSizeInt.Valid {
+		if v, e := strconv.ParseFloat(poolSizeInt.String, 64); e == nil {
+			// 转换为 MB
+			cr.Metrics["innodb_buffer_pool_size"] = v / 1024.0 / 1024.0
+		} else {
+			logger.Debug("解析 innodb_buffer_pool_size 值失败: %v (raw=%s)", e, poolSizeInt.String)
+		}
+	}
+
+	// 计算命中率（如果有读请求与读取次数）
+	if req, ok1 := cr.Metrics["Innodb_buffer_pool_read_requests"]; ok1 && req >= 0 {
+		if reads, ok2 := cr.Metrics["Innodb_buffer_pool_reads"]; ok2 && reads >= 0 && req > 0 {
+			hit := 1.0 - reads/req
+			cr.Metrics["hit_rate"] = hit
+			if hit < 0 {
+				cr.Metrics["hit_rate"] = -1
+			}
+		}
+	}
+
+	return cr, nil
+}
+package collector
+
+import (
+	"context"
+	"database/sql"
+	"strconv"
+
+	"laowang/mysql-health-check/internal/logger"
+	"laowang/mysql-health-check/pkg/core"
+)
+
+// ConnectionCollector 采集连接相关的状态信息。
+type ConnectionCollector struct{}
+
+func NewConnectionCollector() *ConnectionCollector { return &ConnectionCollector{} }
+func (c *ConnectionCollector) Name() string        { return "connection" }
+
+func (c *ConnectionCollector) Collect(ctx context.Context, db *sql.DB) (core.CollectorResult, error) {
+	cr := core.CollectorResult{
+		Name:    c.Name(),
+		Metrics: map[string]float64{},
+		Status:  core.HealthOK,
+	}
+
+	// 预设需要的字段，默认值为 -1（表示不可用/查询失败）
+	expected := []string{
+		"Threads_connected",
+		"Threads_running",
+		"Max_used_connections",
+		"Aborted_connects",
+		"Connection_errors_internal",
+	}
+	for _, k := range expected {
+		cr.Metrics[k] = -1
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SHOW GLOBAL STATUS WHERE Variable_name IN (
+			'Threads_connected', 'Threads_running', 'Max_used_connections',
+			'Aborted_connects', 'Connection_errors_internal'
+		)
+	`)
+	if err != nil {
+		logger.Warn("读取连接状态失败: %v", err)
+		return cr, nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name, val string
+		if err := rows.Scan(&name, &val); err != nil {
+			logger.Warn("扫描连接状态失败: %v", err)
+			continue
+		}
+		if v, e := strconv.ParseFloat(val, 64); e == nil {
+			cr.Metrics[name] = v
+		} else {
+			logger.Debug("解析连接指标 %s 值失败: %v (raw=%s)", name, e, val)
+		}
+	}
+	return cr, nil
+}
+package collector
+
+import (
+	"context"
+	"database/sql"
+	"laowang/mysql-health-check/pkg/core"
+)
+
+// Collector interfaces are defined here for easier import within this package.
+
+type Collector interface {
+	Name() string
+	Collect(ctx context.Context, db *sql.DB) (core.CollectorResult, error)
+}
+
+type SnapshotCollector interface {
+	Collector
+	TakeSnapshot(ctx context.Context, db *sql.DB) (core.Snapshot, error)
+	CalculateDelta(prev, curr core.Snapshot) (core.CollectorResult, error)
+}
+
+// CollectorManager 管理采集器注册与查询
+type CollectorManager struct {
+	singleCollectors   []Collector
+	periodicCollectors []SnapshotCollector
+}
+
+func NewCollectorManager() *CollectorManager {
+	return &CollectorManager{
+		singleCollectors:   make([]Collector, 0),
+		periodicCollectors: make([]SnapshotCollector, 0),
+	}
+}
+
+func (m *CollectorManager) RegisterSingleCollector(c Collector) {
+	m.singleCollectors = append(m.singleCollectors, c)
+}
+
+func (m *CollectorManager) RegisterPeriodicCollector(c SnapshotCollector) {
+	m.periodicCollectors = append(m.periodicCollectors, c)
+}
+
+// GetAllSingleCollectors 返回注册的所有单次采集器
+func (m *CollectorManager) GetAllSingleCollectors() []Collector {
+	return m.singleCollectors
+}
+
+// GetAllPeriodicCollectors 返回注册的所有周期采集器
+func (m *CollectorManager) GetAllPeriodicCollectors() []SnapshotCollector {
+	return m.periodicCollectors
+}
+package collector
+
+import (
+	"context"
+	"database/sql"
+	"strconv"
+	"time"
+
+	"laowang/mysql-health-check/internal/logger"
+	"laowang/mysql-health-check/pkg/core"
+)
+
+// PerformanceCollector 用于采集 MySQL 性能类指标（QPS、TPS、慢查询率等）。
+type PerformanceCollector struct{}
+
+func NewPerformanceCollector() *PerformanceCollector { return &PerformanceCollector{} }
+
+func (c *PerformanceCollector) Name() string { return "performance" }
+
+func (c *PerformanceCollector) Collect(ctx context.Context, db *sql.DB) (core.CollectorResult, error) {
+	return core.CollectorResult{
+		Name:    c.Name(),
+		Metrics: map[string]float64{},
+		Status:  core.HealthOK,
+		Message: "use TakeSnapshot/CalculateDelta instead of Collect",
+	}, nil
+}
+
+func (c *PerformanceCollector) TakeSnapshot(ctx context.Context, db *sql.DB) (core.Snapshot, error) {
+	s := core.Snapshot{
+		Name:   c.Name(),
+		Values: map[string]float64{},
+		Time:   time.Now(),
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SHOW GLOBAL STATUS WHERE Variable_name IN (
+			'Questions','Com_commit','Com_rollback','Slow_queries',
+			'Bytes_sent','Bytes_received'
+		)
+	`)
+	if err != nil {
+		logger.Warn("性能采集器快照查询失败: %v", err)
+		return s, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name, val string
+		if err := rows.Scan(&name, &val); err != nil {
+			logger.Debug("扫描性能指标失败: %v", err)
+			continue
+		}
+		if v, e := strconv.ParseFloat(val, 64); e == nil {
+			s.Values[name] = v
+		} else {
+			logger.Debug("解析性能指标 %s 值失败: %v (raw=%s)", name, e, val)
+		}
+	}
+
+	return s, nil
+}
+
+func (c *PerformanceCollector) CalculateDelta(prev, curr core.Snapshot) (core.CollectorResult, error) {
+	cr := core.CollectorResult{
+		Name:    c.Name(),
+		Metrics: map[string]float64{},
+		Status:  core.HealthOK,
+	}
+
+	// 计算两次快照间的时间差
+	td := curr.Time.Sub(prev.Time).Seconds()
+	if td <= 0 {
+		logger.Warn("性能采集器时间差无效: %v", td)
+		return cr, nil
+	}
+
+	// QPS = (Questions 差值) / 秒数
+	if q1, ok1 := prev.Values["Questions"]; ok1 {
+		if q2, ok2 := curr.Values["Questions"]; ok2 {
+			cr.Metrics["qps"] = (q2 - q1) / td
+		}
+	}
+
+	// TPS = (Com_commit+Com_rollback 差值) / 秒数
+	if c1, ok1 := prev.Values["Com_commit"]; ok1 {
+		if c2, ok2 := curr.Values["Com_commit"]; ok2 {
+			var r1, r2 float64
+			if rb1, ok := prev.Values["Com_rollback"]; ok {
+				r1 = rb1
+			}
+			if rb2, ok := curr.Values["Com_rollback"]; ok {
+				r2 = rb2
+			}
+			cr.Metrics["tps"] = (c2 + r2 - c1 - r1) / td
+		}
+	}
+
+	// 慢查询率 (Slow_queries 差值 / 秒数)
+	if s1, ok1 := prev.Values["Slow_queries"]; ok1 {
+		if s2, ok2 := curr.Values["Slow_queries"]; ok2 {
+			cr.Metrics["slow_qps"] = (s2 - s1) / td
+			// 如果慢查询大于 1 QPS，则标记为警告
+			if cr.Metrics["slow_qps"] > 1.0 {
+				cr.Status = core.HealthWarn
+				cr.Message = "慢查询较多"
+			}
+		}
+	}
+
+	return cr, nil
+}
+package collector
+
+import (
+	"context"
+	"database/sql"
+	"strconv"
+
+	"laowang/mysql-health-check/pkg/core"
+)
+
+type ReplicationCollector struct{}
+
+func NewReplicationCollector() *ReplicationCollector { return &ReplicationCollector{} }
+func (c *ReplicationCollector) Name() string         { return "replication" }
+
+func (c *ReplicationCollector) Collect(ctx context.Context, db *sql.DB) (core.CollectorResult, error) {
+	cr := core.CollectorResult{
+		Name:    c.Name(),
+		Metrics: map[string]float64{},
+		Status:  core.HealthOK,
+		Message: "主库或未配置复制",
+	}
+	// 尝试 SHOW SLAVE STATUS; 若无行则不是从库
+	rows, err := db.QueryContext(ctx, "SHOW SLAVE STATUS")
+	if err != nil {
+		// 非致命，返回默认
+		return cr, nil
+	}
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	if !rows.Next() {
+		return cr, nil
+	}
+	// 动态 scan 所有列为字符串
+	values := make([]sql.NullString, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return cr, nil
+	}
+	// 尝试抽取 Seconds_Behind_Master 字段
+	for i, n := range cols {
+		if n == "Seconds_Behind_Master" {
+			if values[i].Valid {
+				if v, e := strconv.ParseFloat(values[i].String, 64); e == nil {
+					cr.Metrics["seconds_behind_master"] = v
+					if v > 300 {
+						cr.Status = core.HealthWarn
+						cr.Message = "复制延迟较高"
+					}
+				}
+			}
+		}
+	}
+	cr.Message = "检测到从库"
+	return cr, nil
+}
+package collector
+
+import (
+	"time"
+
+	"laowang/mysql-health-check/pkg/core"
+)
+
+// 类型别名，简化在 collector 包中使用 core 包类型时的写法。
+type (
+	Snapshot        = core.Snapshot
+	CollectorResult = core.CollectorResult
+	HealthLevel     = core.HealthLevel
+	InstanceInfo    = core.InstanceInfo
+)
+
+// 常量别名，直接复用 core 包的健康等级。
+const (
+	HealthOK       = core.HealthOK
+	HealthWarn     = core.HealthWarn
+	HealthCritical = core.HealthCritical
+)
+
+// AggregatedResult 表示一次完整健康检查的聚合结果。
+// 包含：
+// - Timestamp：采集时间
+// - Details：每个采集器的结果
+// - Summary：按健康等级统计各采集器数量
+// - Overall：总体健康结论
+
+type AggregatedResult struct {
+	Timestamp time.Time
+	Instance  InstanceInfo
+	Details   map[string]CollectorResult
+	Summary   map[HealthLevel]int
+	Overall   HealthLevel
+	Duration  time.Duration // 执行耗时
+}
+
+// AggregateOverall 根据 summary 中的分布，得出整体健康状态。
+// 规则：
+// - 只要有 Critical，则整体 Critical
+// - 否则如果有 Warn，则整体 Warn
+// - 否则整体 OK
+func AggregateOverall(summary map[HealthLevel]int) HealthLevel {
+	if summary[HealthCritical] > 0 {
+		return HealthCritical
+	}
+	if summary[HealthWarn] > 0 {
+		return HealthWarn
+	}
+	return HealthOK
+}
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"time"
+)
+
+type CollectorToggle struct {
+	Enabled bool `json:"enabled"`
+}
+
+type CollectorConfig struct {
+	Single   map[string]CollectorToggle `json:"single_collectors"`
+	Periodic map[string]CollectorToggle `json:"periodic_collectors"`
+}
+
+type Config struct {
+	// db 简化字段，调试模式下使用 debugDSN
+	DebugMode bool `json:"debug_mode"`
+
+	Host         string        `json:"host"`
+	Port         int           `json:"port"`
+	User         string        `json:"user"`
+	Password     string        `json:"password"`
+	Database     string        `json:"database"`
+	LogLevel     string        `json:"log_level"`
+	RunPeriodic  bool          `json:"run_periodic"`
+	Period       time.Duration `json:"period"`
+	QueryTimeout time.Duration `json:"query_timeout"`
+	TotalTimeout time.Duration `json:"total_timeout"`
+	Output       string        `json:"output_format"`
+
+	Collectors CollectorConfig `json:"collectors"`
+
+	// debug defaults
+	debugDSN          string
+	debugLogLevel     string
+	debugRunPeriodic  bool
+	debugPeriod       time.Duration
+	debugQueryTimeout time.Duration
+}
+
+func NewConfig() *Config {
+	c := &Config{
+		DebugMode:    true,
+		Host:         "172.17.139.15",
+		Port:         16315,
+		User:         "admin",
+		Password:     "!QAZ2wsx",
+		Database:     "",
+		LogLevel:     "debug",
+		RunPeriodic:  true,
+		Period:       5 * time.Second,
+		QueryTimeout: 5 * time.Second,
+		TotalTimeout: 20 * time.Second,
+		Output:       "text",
+	}
+	c.debugDSN = "root:root1234@tcp(127.0.0.1:3306)/?parseTime=true"
+	c.debugLogLevel = "debug"
+	c.debugRunPeriodic = true
+	c.debugPeriod = 5 * time.Second
+	c.debugQueryTimeout = 5 * time.Second
+
+	c.setDefaultCollectors()
+	return c
+}
+
+func (c *Config) setDefaultCollectors() {
+	c.Collectors = CollectorConfig{
+		Single: map[string]CollectorToggle{
+			"base":        {Enabled: true},
+			"connection":  {Enabled: true},
+			"buffer_pool": {Enabled: true},
+			"replication": {Enabled: true},
+		},
+		Periodic: map[string]CollectorToggle{
+			"performance": {Enabled: true},
+		},
+	}
+}
+
+func (c *Config) LoadFromFile(path string) error {
+	if c.DebugMode {
+		fmt.Printf("调试模式：尝试加载配置文件 %s\n", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if c.DebugMode {
+			fmt.Printf("读取配置失败，使用默认: %v\n", err)
+		}
+		return nil
+	}
+	if err := json.Unmarshal(data, c); err != nil {
+		return fmt.Errorf("配置解析失败: %w", err)
+	}
+	return nil
+}
+
+func (c *Config) GetDSN() string {
+	if c.DebugMode {
+		return c.debugDSN
+	}
+	return ""
+}
+
+func (c *Config) GetHost() string     { return c.Host }
+func (c *Config) GetPort() int        { return c.Port }
+func (c *Config) GetUser() string     { return c.User }
+func (c *Config) GetPassword() string { return c.Password }
+func (c *Config) GetDatabase() string { return c.Database }
+func (c *Config) GetLogLevel() string {
+	if c.DebugMode {
+		return c.debugLogLevel
+	}
+	return c.LogLevel
+}
+func (c *Config) ShouldRunPeriodic() bool {
+	if c.DebugMode {
+		return c.debugRunPeriodic
+	}
+	return c.RunPeriodic
+}
+func (c *Config) GetPeriod() time.Duration {
+	if c.DebugMode {
+		return c.debugPeriod
+	}
+	return c.Period
+}
+func (c *Config) GetQueryTimeout() time.Duration {
+	if c.DebugMode {
+		return c.debugQueryTimeout
+	}
+	return c.QueryTimeout
+}
+func (c *Config) GetTotalTimeout() time.Duration { return c.TotalTimeout }
+func (c *Config) OutputFormat() string           { return c.Output }
+func (c *Config) IsCollectorEnabled(typ, name string) bool {
+	if typ == "single" {
+		if v, ok := c.Collectors.Single[name]; ok {
+			return v.Enabled
+		}
+		return true
+	}
+	if typ == "periodic" {
+		if v, ok := c.Collectors.Periodic[name]; ok {
+			return v.Enabled
+		}
+		return true
+	}
+	return false
+}
+package exporter
+
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"laowang/mysql-health-check/internal/collector"
+)
+
+type Exporter interface {
+	Export(res *collector.AggregatedResult) error
+}
+
+type TextExporter struct{}
+
+func NewTextExporter() *TextExporter { return &TextExporter{} }
+
+func (e *TextExporter) Export(res *collector.AggregatedResult) error {
+	fmt.Printf("\n%s\n", strings.Repeat("=", 70))
+	fmt.Printf("MySQL 健康检查报告\n")
+	fmt.Printf("%s\n", strings.Repeat("=", 70))
+
+	// 实例信息
+	fmt.Printf("实例地址: %s:%d\n", res.Instance.Host, res.Instance.Port)
+	if res.Instance.Version != "" {
+		fmt.Printf("MySQL版本: %s\n", res.Instance.Version)
+	}
+	fmt.Printf("检查时间: %s\n", res.Timestamp.Format("2006-01-02 15:04:05"))
+	fmt.Printf("执行耗时: %v\n", res.Duration.Round(time.Millisecond))
+
+	// 总体状态
+	statusColor := e.getStatusColor(res.Overall)
+	fmt.Printf("总体状态: %s\n", statusColor(res.Overall.String()))
+	fmt.Printf("%s\n", strings.Repeat("-", 70))
+
+	// 按照固定顺序显示采集器
+	collectorOrder := []string{"base", "connection", "buffer_pool", "replication", "performance"}
+	for _, name := range collectorOrder {
+		if r, exists := res.Details[name]; exists {
+			e.displayCollectorResult(name, r)
+		}
+	}
+
+	fmt.Printf("\n%s\n", strings.Repeat("=", 70))
+	fmt.Printf("统计摘要: OK=%d, WARN=%d, CRITICAL=%d\n",
+		res.Summary[collector.HealthOK],
+		res.Summary[collector.HealthWarn],
+		res.Summary[collector.HealthCritical])
+	fmt.Printf("%s\n", strings.Repeat("=", 70))
+
+	return nil
+}
+
+func (e *TextExporter) displayCollectorResult(name string, r collector.CollectorResult) {
+	statusColor := e.getStatusColor(r.Status)
+
+	switch name {
+	case "base":
+		fmt.Printf("\n[%s] %s - 基础信息\n", name, statusColor(r.Status.String()))
+		// base部分不显示版本信息，只显示运行时间等指标
+		e.displayOrderedMetrics(r.Metrics, []string{"uptime_days", "uptime_hours", "uptime_s"})
+
+	case "connection":
+		fmt.Printf("\n[%s] %s - 连接状态\n", name, statusColor(r.Status.String()))
+		e.displayOrderedMetrics(r.Metrics, []string{
+			"Threads_connected",
+			"Threads_running",
+			"Max_used_connections",
+			"Aborted_connects",
+			"Connection_errors_internal",
+		})
+
+	case "buffer_pool":
+		fmt.Printf("\n[%s] %s - InnoDB缓冲池\n", name, statusColor(r.Status.String()))
+		e.displayBufferPoolMetrics(r.Metrics)
+
+	case "replication":
+		fmt.Printf("\n[%s] %s - %s\n", name, statusColor(r.Status.String()), r.Message)
+		if len(r.Metrics) > 0 {
+			e.displayOrderedMetrics(r.Metrics, []string{"seconds_behind_master"})
+		}
+
+	case "performance":
+		fmt.Printf("\n[%s] %s - 性能指标\n", name, statusColor(r.Status.String()))
+		e.displayOrderedMetrics(r.Metrics, []string{"qps", "tps", "slow_qps"})
+
+	default:
+		fmt.Printf("\n[%s] %s - %s\n", name, statusColor(r.Status.String()), r.Message)
+		e.displayGenericMetrics(r.Metrics)
+	}
+}
+
+func (e *TextExporter) displayBufferPoolMetrics(metrics map[string]float64) {
+	// 定义缓冲池指标的分组和顺序
+	groups := []struct {
+		title   string
+		metrics []string
+	}{
+		{
+			"缓冲池大小",
+			[]string{"innodb_buffer_pool_size"},
+		},
+		{
+			"页面分布",
+			[]string{
+				"Innodb_buffer_pool_pages_total",
+				"Innodb_buffer_pool_pages_data",
+				"Innodb_buffer_pool_pages_free",
+				"Innodb_buffer_pool_pages_dirty",
+				"Innodb_buffer_pool_pages_misc",
+				"Innodb_buffer_pool_pages_old",
+			},
+		},
+		{
+			"读写统计",
+			[]string{
+				"Innodb_buffer_pool_read_requests",
+				"Innodb_buffer_pool_reads",
+				"Innodb_buffer_pool_write_requests",
+				"Innodb_buffer_pool_pages_flushed",
+				"hit_rate",
+			},
+		},
+		{
+			"预读统计",
+			[]string{
+				"Innodb_buffer_pool_read_ahead",
+				"Innodb_buffer_pool_read_ahead_rnd",
+				"Innodb_buffer_pool_read_ahead_evicted",
+			},
+		},
+		{
+			"其他指标",
+			[]string{
+				"Innodb_buffer_pool_bytes_data",
+				"Innodb_buffer_pool_bytes_dirty",
+				"Innodb_buffer_pool_pages_made_young",
+				"Innodb_buffer_pool_pages_made_not_young",
+				"Innodb_buffer_pool_pages_LRU_flushed",
+				"Innodb_buffer_pool_wait_free",
+				"Innodb_buffer_pool_resize_status_code",
+				"Innodb_buffer_pool_resize_status_progress",
+			},
+		},
+	}
+
+	for _, group := range groups {
+		// 检查该组中是否有实际存在的指标
+		hasMetrics := false
+		for _, metric := range group.metrics {
+			if _, exists := metrics[metric]; exists {
+				hasMetrics = true
+				break
+			}
+		}
+
+		if hasMetrics {
+			fmt.Printf("  %s:\n", group.title)
+			e.displayOrderedMetrics(metrics, group.metrics)
+		}
+	}
+}
+
+func (e *TextExporter) displayOrderedMetrics(metrics map[string]float64, order []string) {
+	maxKeyLen := 0
+	for _, k := range order {
+		if _, exists := metrics[k]; exists && len(k) > maxKeyLen {
+			maxKeyLen = len(k)
+		}
+	}
+
+	for _, k := range order {
+		if v, exists := metrics[k]; exists && v != -1 {
+			padding := strings.Repeat(" ", maxKeyLen-len(k))
+			formattedValue := e.formatMetricValue(k, v)
+			fmt.Printf("  %s%s: %s\n", k, padding, formattedValue)
+		}
+	}
+}
+
+func (e *TextExporter) displayGenericMetrics(metrics map[string]float64) {
+	keys := make([]string, 0, len(metrics))
+	for k := range metrics {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	e.displayOrderedMetrics(metrics, keys)
+}
+
+func (e *TextExporter) formatMetricValue(key string, value float64) string {
+	// 特殊处理某些指标的显示格式
+	switch {
+	case value == -1:
+		return "N/A"
+	case strings.Contains(key, "rate") || strings.Contains(key, "hit_rate"):
+		return fmt.Sprintf("%.2f%%", value*100)
+	case key == "innodb_buffer_pool_size":
+		return fmt.Sprintf("%.0f MB", value)
+	case value == float64(int64(value)):
+		// 对大数值使用千位分隔符
+		intVal := int64(value)
+		if intVal > 1000 {
+			return e.formatWithCommas(intVal)
+		}
+		return fmt.Sprintf("%d", intVal)
+	case value < 0.01:
+		return fmt.Sprintf("%.6f", value)
+	case value < 0.1:
+		return fmt.Sprintf("%.5f", value)
+	case value < 1:
+		return fmt.Sprintf("%.4f", value)
+	case value < 10:
+		return fmt.Sprintf("%.3f", value)
+	case value < 100:
+		return fmt.Sprintf("%.2f", value)
+	case value < 1000:
+		return fmt.Sprintf("%.1f", value)
+	default:
+		return e.formatWithCommas(int64(value))
+	}
+}
+
+func (e *TextExporter) formatWithCommas(n int64) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+
+	parts := []string{}
+	for n > 0 {
+		parts = append([]string{fmt.Sprintf("%03d", n%1000)}, parts...)
+		n /= 1000
+	}
+
+	// 去除前导零
+	result := strings.TrimLeft(parts[0], "0")
+	if result == "" {
+		result = "0"
+	}
+	for i := 1; i < len(parts); i++ {
+		result += "," + parts[i]
+	}
+	return result
+}
+
+func (e *TextExporter) getStatusColor(status collector.HealthLevel) func(string) string {
+	colorCodes := map[collector.HealthLevel]string{
+		collector.HealthOK:       "32", // 绿色
+		collector.HealthWarn:     "33", // 黄色
+		collector.HealthCritical: "31", // 红色
+	}
+
+	return func(text string) string {
+		code := colorCodes[status]
+		return fmt.Sprintf("\033[%sm%s\033[0m", code, text)
+	}
+}
+
+type JSONExporter struct{}
+
+func NewJSONExporter() *JSONExporter { return &JSONExporter{} }
+
+func (e *JSONExporter) Export(res *collector.AggregatedResult) error {
+	enhancedResult := map[string]interface{}{
+		"timestamp": res.Timestamp,
+		"instance": map[string]interface{}{
+			"host":    res.Instance.Host,
+			"port":    res.Instance.Port,
+			"version": res.Instance.Version,
+		},
+		"duration_seconds": res.Duration.Seconds(),
+		"overall_status":   res.Overall.String(),
+		"summary":          res.Summary,
+		"details":          res.Details,
+	}
+
+	b, err := json.MarshalIndent(enhancedResult, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(b))
+	return nil
+}
+package logger
+
+import (
+	"log"
+	"os"
+	"strings"
+)
+
+type Level int
+
+const (
+	DebugLevel Level = iota
+	InfoLevel
+	WarnLevel
+	ErrorLevel
+	FatalLevel
+)
+
+var (
+	currentLevel Level
+	lg           = log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+)
+
+func InitLogger(level string) {
+	switch strings.ToLower(level) {
+	case "debug":
+		currentLevel = DebugLevel
+	case "info":
+		currentLevel = InfoLevel
+	case "warn":
+		currentLevel = WarnLevel
+	case "error":
+		currentLevel = ErrorLevel
+	default:
+		currentLevel = InfoLevel
+	}
+	Info("logger initialized level=%s", level)
+}
+
+func Debug(fmtStr string, v ...interface{}) {
+	if currentLevel <= DebugLevel {
+		lg.Printf("[DEBUG] "+fmtStr, v...)
+	}
+}
+func Info(fmtStr string, v ...interface{}) {
+	if currentLevel <= InfoLevel {
+		lg.Printf("[INFO] "+fmtStr, v...)
+	}
+}
+func Warn(fmtStr string, v ...interface{}) {
+	if currentLevel <= WarnLevel {
+		lg.Printf("[WARN] "+fmtStr, v...)
+	}
+}
+func Error(fmtStr string, v ...interface{}) {
+	if currentLevel <= ErrorLevel {
+		lg.Printf("[ERROR] "+fmtStr, v...)
+	}
+}
+func Fatal(fmtStr string, v ...interface{}) {
+	lg.Fatalf("[FATAL] "+fmtStr, v...)
+}
+package core
+
+import (
+	"time"
+)
+
+// HealthLevel 健康等级
+type HealthLevel int
+
+const (
+	HealthOK HealthLevel = iota
+	HealthWarn
+	HealthCritical
+)
+
+func (h HealthLevel) String() string {
+	switch h {
+	case HealthOK:
+		return "OK"
+	case HealthWarn:
+		return "WARN"
+	case HealthCritical:
+		return "CRITICAL"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// Snapshot 代表一次快照
+type Snapshot struct {
+	Name   string
+	Values map[string]float64
+	Time   time.Time
+}
+
+// CollectorResult 单次或增量采集结果
+type CollectorResult struct {
+	Name    string
+	Metrics map[string]float64
+	Status  HealthLevel
+	Message string
+}
+
+// InstanceInfo 实例信息
+type InstanceInfo struct {
+	Host    string
+	Port    int
+	Version string
+}
+package dbconn
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+type Config struct {
+	Host           string
+	Port           int
+	User           string
+	Password       string
+	Database       string
+	ConnectTimeout time.Duration
+	QueryTimeout   time.Duration
+}
+
+func NewConnection(cfg Config) (*sql.DB, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&timeout=%s&readTimeout=%s&writeTimeout=%s",
+		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Database,
+		cfg.ConnectTimeout.String(), cfg.QueryTimeout.String(), cfg.QueryTimeout.String(),
+	)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}

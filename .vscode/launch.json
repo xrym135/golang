@@ -1,0 +1,22 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch main.go", // 配置名称（自定义，便于识别）
+            "type": "go",                  // 调试类型（固定为 go，对应 Go 插件）
+            "request": "launch",           // 调试模式（launch = 启动调试；attach = 附加到已运行进程）
+            "mode": "debug",               // 运行模式（debug = 调试模式；run = 仅运行不调试；auto = 自动判断）
+            // 关键：固定指向 xxxx.main.go 文件路径
+            // ${workspaceFolder} 表示 VS Code 打开的“项目根目录”，需根据文件实际位置补充相对路径
+            "program": "${workspaceFolder}\\src\\mysql-inspector\\main.go" ,
+            "args": [],
+            // 可选：调试时的环境变量（如 GOPATH、自定义变量等）
+            "env": [],
+            // 可选：是否显示详细调试日志（调试配置出错时可设为 true 排查问题）
+            "showLog": false
+        }
+    ]
+}
